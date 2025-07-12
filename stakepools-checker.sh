@@ -14,7 +14,7 @@
 # Stand with Ukraine 🇺🇦
 #
 
-
+start_time=$(date +%s)
 
 # colors
 CYAN='\033[0;36m'
@@ -95,52 +95,6 @@ retry_command() {
     echo "$default_value"; return 1
 }
 
-function check_key_pair () {
-    local DONE_STAKES_REF=($1)
-    local KEYS_PAIR="$2"
-
-    local KEY_S_TO_CHECK="${KEYS_PAIR%%+*}"
-    local KEY_W_TO_CHECK="${KEYS_PAIR##*+}"
-
-    # 🔁 Avoid duplicate processing
-    for key in "${DONE_STAKES_REF[@]}"; do
-        [[ "$KEY_S_TO_CHECK" == "$key" || "$KEY_W_TO_CHECK" == "$key" ]] && return 1
-    done
-
-    local RETURN_INFO=""
-    local FOUND_S="W"
-    local KEY_RESULT="\t"
-
-    # 🔍 Quick lookup by stake authority
-    if [[ -n "${INDEX_BY_STAKE_AUTH[$KEY_S_TO_CHECK]}" ]]; then
-        local j="${INDEX_BY_STAKE_AUTH[$KEY_S_TO_CHECK]}"
-        case "$AGGREGATION_MODE" in
-            pool) RETURN_INFO="${STAKE_AUTH_NAMES[$j]}" ;;
-            group) RETURN_INFO="${POOL_AUTH_GROUPS[$j]:-UNKNOWN}" ;;
-            category) RETURN_INFO="${POOL_AUTH_CATEGORIES[$j]:-UNKNOWN}" ;;
-        esac
-        FOUND_S="S"
-        KEY_RESULT="$KEY_S_TO_CHECK"
-    elif [[ -n "${INDEX_BY_WTHDR[$KEY_W_TO_CHECK]}" ]]; then
-        local k="${INDEX_BY_WTHDR[$KEY_W_TO_CHECK]}"
-        case "$AGGREGATION_MODE" in
-            pool) RETURN_INFO="${STAKE_NAMES[$k]}" ;;
-            group) RETURN_INFO="${POOL_GROUPS[$k]:-UNKNOWN}" ;;
-            category) RETURN_INFO="${POOL_CATEGORIES[$k]:-UNKNOWN}" ;;
-        esac
-        KEY_RESULT="$KEY_W_TO_CHECK"
-    fi
-
-    local RETURN_KEY_TYPE_NAME=""
-    if [[ -z "$RETURN_INFO" ]]; then
-        RETURN_KEY_TYPE_NAME="$KEY_W_TO_CHECK W \t"
-    else
-        RETURN_KEY_TYPE_NAME="$KEY_RESULT $FOUND_S $RETURN_INFO"
-    fi
-
-    echo "${RETURN_KEY_TYPE_NAME}^${KEY_RESULT} ${DONE_STAKES_REF[*]}"
-}
-
 
 function sort_data() {
     local sortable_data=()
@@ -164,13 +118,17 @@ function sort_data() {
         [[ -z "$info" || "$info" == "\\t" ]] && info=""
         percent=$(printf "%.3f%%" "$percent")
         
+		display_key="${NAME_TO_KEY[$key]:-$key}"
+		if (( ${#display_key} > 45 )); then display_key="{${display_key:0:29}..............}"; fi
+		# display_key="$key"
+        
         # Уникнення експоненційної нотації та обрізка .000
 		[[ "$active" =~ ^0(\.0+)?$ ]] && active="0" || active=$(printf "%.3f" "$active")
 		[[ "$deactivating" =~ ^0(\.0+)?$ ]] && deactivating="0" || deactivating=$(printf "%.3f" "$deactivating")
 		[[ "$activating" =~ ^0(\.0+)?$ ]] && activating="0" || activating=$(printf "%.3f" "$activating")
 
         printf "%-47s %-7d ${LIGHTPURPLE}%-23s${NOCOLOR} ${LIGHTBLUE}%-15s${NOCOLOR} ${CYAN}%-15s${NOCOLOR} ${RED}%-15s${NOCOLOR} ${GREEN}%-15s${NOCOLOR}\n" \
-          "$key" "$count" "$info" "$percent" "$active" "$deactivating" "$activating"
+          "$display_key" "$count" "$info" "$percent" "$active" "$deactivating" "$activating"
     done <<< "$sorted_data"
 }
 
@@ -312,57 +270,34 @@ echo -e "${DARKGRAY}All Stakers of $NODE_NAME | $YOUR_VOTE_ACCOUNT | Epoch ${THI
 
 ALL_MY_STAKES_JSON=$(retry_command "solana ${SOLANA_CLUSTER} stakes ${YOUR_VOTE_ACCOUNT} --output json-compact" 10 "" false)
 
-# 🔄 Агрегуємо відразу все по staker+withdrawer
-# AGG_JSON=$(echo "$ALL_MY_STAKES_JSON" | jq -c '
-#   map(select(.staker != null and .withdrawer != null and .staker != "" and .withdrawer != ""))
-#   | sort_by(.staker + "+" + .withdrawer)
-#   | group_by(.staker + "+" + .withdrawer)
-#   | map({
-#       pair: (.[0].staker + "+" + .[0].withdrawer),
-#       count: length,
-#       active: (map(.activeStake // 0) | add / 1e9),
-#       activating: (map(.activatingStake // 0) | add / 1e9),
-#       deactivating: (map(.deactivatingStake // 0) | add / 1e9)
-#     })
-#   | reduce .[] as $item (
-#       {}; . + { ($item.pair): {count: $item.count, active: $item.active, activating: $item.activating, deactivating: $item.deactivating} }
-#     )
-# ')
+# 🔁 Фаза 1: кеш всіх stake акаунтів
+declare -A STAKE_ACCOUNT_ACTIVE
+declare -A STAKE_ACCOUNT_ACTIVATING
+declare -A STAKE_ACCOUNT_DEACTIVATING
+declare -A STAKE_ACCOUNT_STAKER
+declare -A STAKE_ACCOUNT_WITHDRAWER
 
-# AGG_JSON=$(echo "$ALL_MY_STAKES_JSON" | jq -c '
-#   map(select(.staker != null and .withdrawer != null and .staker != "" and .withdrawer != ""))
-#   | sort_by(.staker + "+" + .withdrawer)
-#   | group_by(.staker + "+" + .withdrawer)
-#   | map({
-#       key: (.[0].staker + "+" + .[0].withdrawer),
-#       value: {
-#         count: length,
-#         active: (map(.activeStake // 0) | add / 1e9),
-#         activating: (map(.activatingStake // 0) | add / 1e9),
-#         deactivating: (map(.deactivatingStake // 0) | add / 1e9)
-#       }
-#     })
-#   | from_entries
-# ')
-
-
-# Кеш stake-аккаунтів
-declare -A STAKES_BY_PAIR
+ALL_STAKE_PUBKEYS=()
 
 while IFS=$'\t' read -r stake_key staker withdrawer active activating deactivating; do
-  key_pair="${staker}+${withdrawer}"
-  STAKES_BY_PAIR["$key_pair"]+="$active,$activating,$deactivating;"
+  STAKE_ACCOUNT_ACTIVE["$stake_key"]="$active"
+  STAKE_ACCOUNT_ACTIVATING["$stake_key"]="$activating"
+  STAKE_ACCOUNT_DEACTIVATING["$stake_key"]="$deactivating"
+  STAKE_ACCOUNT_STAKER["$stake_key"]="$staker"
+  STAKE_ACCOUNT_WITHDRAWER["$stake_key"]="$withdrawer"
+  ALL_STAKE_PUBKEYS+=("$stake_key")
 done < <(jq -r '.[] | [.stakePubkey, .staker, .withdrawer, (.activeStake // 0), (.activatingStake // 0), (.deactivatingStake // 0)] | @tsv' <<< "$ALL_MY_STAKES_JSON")
 
-mapfile -t ALL_STAKERS_KEYS_PAIRS < <(
-  echo "$ALL_MY_STAKES_JSON" | jq -r '.[] | "\(.staker)+\(.withdrawer)"' | sort -u
-)
 
-# 
-# # ⏩ Формуємо список пар ключів
-# mapfile -t ALL_STAKERS_KEYS_PAIRS < <(
-#   echo "$AGG_JSON" | jq -r 'keys[]'
-# )
+
+ALL_MY_STAKES_FILE=$(mktemp "/tmp/stakes_json_$(date +%s%N)_XXXXXX.json")
+echo "$ALL_MY_STAKES_JSON" > "$ALL_MY_STAKES_FILE"
+
+cleanup_tmp_file() {
+  [[ -f "$ALL_MY_STAKES_FILE" ]] && rm -f "$ALL_MY_STAKES_FILE"
+  [[ -n "$UNUSED_KEYS_FILE" && -f "$UNUSED_KEYS_FILE" ]] && rm -f "$UNUSED_KEYS_FILE"
+}
+trap cleanup_tmp_file EXIT
 
 
 
@@ -379,196 +314,222 @@ DEACTIVATING_STAKE_COUNT=$(echo "$ALL_MY_STAKES_JSON" | jq '[.[] | select(.deact
 TOTAL_ACTIVE_STAKE_COUNT=$((TOTAL_STAKE_COUNT - ACTIVATING_STAKE_COUNT))
 
 
-OTHER_count=0
-OTHER_percent=0
-OTHER_active=0
-OTHER_deactivating=0
-OTHER_activating=0
+# processed=0
+# start_time=$(date +%s)
 
-DONE_STAKES=""
 
-declare -A STAKE_AUTH_NAMES_MAP
-for ((i=0; i<${#STAKE_AUTHORITY[@]}; i++)); do
-  STAKE_AUTH_NAMES_MAP["${STAKE_AUTHORITY[$i]}"]="${STAKE_AUTH_NAMES[$i]}"
-done
+# ➕ Фаза 1: STAKER KEY обробка
+declare -A USED_STAKE_KEYS
+declare -A NAME_TO_KEY  # для групування
 
-declare -A POOL_AUTH_GROUPS_MAP
-for ((i=0; i<${#STAKE_AUTHORITY[@]}; i++)); do
-  POOL_AUTH_GROUPS_MAP["${STAKE_AUTHORITY[$i]}"]="${POOL_AUTH_GROUPS[$i]}"
-done
-
-declare -A POOL_AUTH_CATEGORIES_MAP
-for ((i=0; i<${#STAKE_AUTHORITY[@]}; i++)); do
-  POOL_AUTH_CATEGORIES_MAP["${STAKE_AUTHORITY[$i]}"]="${POOL_AUTH_CATEGORIES[$i]}"
-done
-
-# Попередня обробка всіх S-ключів напряму (до основного циклу)
-for s_key in "${STAKE_AUTHORITY[@]}"; do
-  stake_entries=$(echo "$ALL_MY_STAKES_JSON" | jq -c --arg key "$s_key" '.[] | select(.staker == $key)')
-
-  count=0
-  active=0
-  deactivating=0
-  activating=0
-
-  while IFS= read -r stake; do
-      s_active=$(echo "$stake" | jq '.activeStake // 0')
-      s_deactivating=$(echo "$stake" | jq '.deactivatingStake // 0')
-      s_activating=$(echo "$stake" | jq '.activatingStake // 0')
-
-      [[ "$s_active" != "0" ]] && ((count++))
-      active=$((active + s_active))
-      deactivating=$((deactivating + s_deactivating))
-      activating=$((activating + s_activating))
-  done <<< "$stake_entries"
-
-  # ⛔ Пропускаємо, якщо повністю порожній
-  if [[ "$active" == "0" && "$deactivating" == "0" && "$activating" == "0" ]]; then
-    continue
-  fi
-
-  active=$(awk -v n="$active" 'BEGIN{printf "%.3f", n/1e9}')
-  deactivating=$(awk -v n="$deactivating" 'BEGIN{printf "%.3f", n/1e9}')
-  activating=$(awk -v n="$activating" 'BEGIN{printf "%.3f", n/1e9}')
+for s_key in "${!INDEX_BY_STAKE_AUTH[@]}"; do
+  index="${INDEX_BY_STAKE_AUTH[$s_key]}"
 
   case "$AGGREGATION_MODE" in
-    pool) NAME="${STAKE_AUTH_NAMES_MAP[$s_key]}" ;;
-    group) NAME="${POOL_AUTH_GROUPS_MAP[$s_key]:-UNKNOWN}" ;;
-    category) NAME="${POOL_AUTH_CATEGORIES_MAP[$s_key]:-UNKNOWN}" ;;
+    pool) NAME="${STAKE_AUTH_NAMES[$index]}" ;;
+    group) NAME="${POOL_AUTH_GROUPS[$index]:-UNKNOWN}" ;;
+    category) NAME="${POOL_AUTH_CATEGORIES[$index]:-UNKNOWN}" ;;
   esac
 
-  percent=$(awk -v a="$active" -v b="$TOTAL_ACTIVE_STAKE" 'BEGIN {if(b==0) print 0; else printf "%.3f", 100 * a / b}')
+  [[ -z "$NAME" ]] && continue
 
-  data["$s_key"]=$count:$NAME:$(
-    echo "$percent" | sed -r 's/^(.{12}).*$/\1/'
-  ):$(
-    echo "$active" | sed -r 's/^(.{12}).*$/\1/'
-  ):$(
-    echo "$deactivating" | sed -r 's/^(.{12}).*$/\1/'
-  ):$(
-    echo "$activating" | sed -r 's/^(.{12}).*$/\1/'
-  )
-
-  DONE_STAKES+=" $s_key"
-done
-
-
-processed=0
-start_time=$(date +%s)
-
-for i in "${ALL_STAKERS_KEYS_PAIRS[@]}"; do
-
-	((processed++))
-	if (( processed % 100 == 0 )); then
-	  current_time=$(date +%s)
-	  elapsed=$((current_time - start_time))
-	  total=${#ALL_STAKERS_KEYS_PAIRS[@]}
-	
-	  # Форматований час, що минув
-	  elapsed_fmt=$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))
-	
-	  # Оцінка часу до кінця (на основі середньої швидкості)
-	  if (( processed > 0 )); then
-		estimated_total_time=$(( (elapsed * total) / processed ))
-		remaining=$((estimated_total_time - elapsed))
-		remaining_fmt=$(printf '%02d:%02d' $((remaining/60)) $((remaining%60)))
-	  else
-		remaining_fmt="??:??"
-	  fi
-	
-	  echo -e "${LIGHTGRAY}Processed $processed / $total pairs... (${elapsed_fmt} elapsed, ~${remaining_fmt} remaining)${NOCOLOR}"
-	fi
-
-
-
-	if [[ -n "${CHECKED_KEYS[$i]}" ]]; then
-	  RES="${CHECKED_KEYS[$i]}"
-	else
-	  RES=$(check_key_pair "$DONE_STAKES" "$i")
-	  [[ -z "$RES" ]] && continue
-	  CHECKED_KEYS["$i"]="$RES"
-	fi
-
-    KEY_TYPE_NAME=$(echo "$RES" | cut -d'^' -f1)
-    DONE_STAKES=$(echo "$RES" | cut -d'^' -f2)
-
-    KEY=$(echo "$KEY_TYPE_NAME" | cut -d' ' -f1)
-    TYPE=$(echo "$KEY_TYPE_NAME" | cut -d' ' -f2)
-    NAME=$(echo "$KEY_TYPE_NAME" | cut -d' ' -f3)
-
-# count=$(jq -r --arg pair "$i" '.[$pair].count' <<< "$AGG_JSON")
-# active=$(jq -r --arg pair "$i" '.[$pair].active' <<< "$AGG_JSON")
-# activating=$(jq -r --arg pair "$i" '.[$pair].activating' <<< "$AGG_JSON")
-# deactivating=$(jq -r --arg pair "$i" '.[$pair].deactivating' <<< "$AGG_JSON")
-
-    stake_values="${STAKES_BY_PAIR[$i]}"
-    [[ -z "$stake_values" ]] && continue
+  for stake_pubkey in "${ALL_STAKE_PUBKEYS[@]}"; do
     
-# ВИВЕСТИ ПО БОНДУ ЯК ДЕБАГ
+# ((processed++))
+# if (( processed % 2000 == 0 )); then
+#   current_time=$(date +%s)
+#   elapsed=$((current_time - start_time))
+#   total=$((${#ALL_STAKE_PUBKEYS[@]}*${#INDEX_BY_STAKE_AUTH[@]}))
+# 
+#   # Форматований час, що минув
+#   elapsed_fmt=$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))
+# 
+#   # Оцінка часу до кінця (на основі середньої швидкості)
+#   if (( processed > 0 )); then
+# 	estimated_total_time=$(( (elapsed * total) / processed ))
+# 	remaining=$((estimated_total_time - elapsed))
+# 	remaining_fmt=$(printf '%02d:%02d' $((remaining/60)) $((remaining%60)))
+#   else
+# 	remaining_fmt="??:??"
+#   fi
+# 
+#   echo -e "${LIGHTGRAY}STAKER KEY | Processed $processed / $total pairs... (${elapsed_fmt} elapsed, ~${remaining_fmt} remaining)${NOCOLOR}"
+# fi
 
-    count=$(echo "$stake_values" | tr ';' '\n' | grep -v '^$' | wc -l)
-    active=$(echo "$stake_values" | tr ';' '\n' | cut -d',' -f1 | awk '{sum+=$1} END{printf "%.3f", sum/1e9}')
-    activating=$(echo "$stake_values" | tr ';' '\n' | cut -d',' -f2 | awk '{sum+=$1} END{printf "%.3f", sum/1e9}')
-    deactivating=$(echo "$stake_values" | tr ';' '\n' | cut -d',' -f3 | awk '{sum+=$1} END{printf "%.3f", sum/1e9}')
+    [[ -n "${USED_STAKE_KEYS[$stake_pubkey]}" ]] && continue
+    [[ "${STAKE_ACCOUNT_STAKER[$stake_pubkey]}" != "$s_key" ]] && continue
 
-    if [[ -z "$NAME" || "$NAME" == "\\t" || "$NAME" == "" ]]; then
-        ((OTHER_count+=count))
-        OTHER_active=$(awk -v a="$OTHER_active" -v b="$active" 'BEGIN{printf "%.3f", a + b}')
-        OTHER_deactivating=$(awk -v a="$OTHER_deactivating" -v b="$deactivating" 'BEGIN{printf "%.3f", a + b}')
-        OTHER_activating=$(awk -v a="$OTHER_activating" -v b="$activating" 'BEGIN{printf "%.3f", a + b}')
-        continue
-    fi
+    active=${STAKE_ACCOUNT_ACTIVE[$stake_pubkey]}
+    activating=${STAKE_ACCOUNT_ACTIVATING[$stake_pubkey]}
+    deactivating=${STAKE_ACCOUNT_DEACTIVATING[$stake_pubkey]}
 
-    if [[ "$AGGREGATION_MODE" == "group" || "$AGGREGATION_MODE" == "category" ]]; then
-        key_for_data="$NAME"
+    active_gb=$(awk -v n="$active" 'BEGIN{printf "%.3f", n/1e9}')
+    activating_gb=$(awk -v n="$activating" 'BEGIN{printf "%.3f", n/1e9}')
+    deactivating_gb=$(awk -v n="$deactivating" 'BEGIN{printf "%.3f", n/1e9}')
+
+    key_for_data="$NAME"
+    if [[ -n "${NAME_TO_KEY[$NAME]}" ]]; then
+      # уже є — дописуємо до ключа (для виводу)
+      if [[ "${NAME_TO_KEY[$NAME]}" != "$s_key" ]]; then NAME_TO_KEY[$NAME]="${NAME_TO_KEY[$NAME]}+$s_key"; fi
     else
-        key_for_data="$KEY"
+      NAME_TO_KEY[$NAME]="$s_key"
     fi
 
-    if [[ -n "${data[$key_for_data]}" ]]; then
-        IFS=':' read -r prev_count prev_name prev_percent prev_active prev_deactivating prev_activating <<< "${data[$key_for_data]}"
+    if [[ -n "${data[$NAME]}" ]]; then
+      IFS=":" read -r count oldname percent a d act <<< "${data[$NAME]}"
+      new_count=$((count + 1))
+      a=$(awk -v a="$a" -v b="$active_gb" 'BEGIN{printf "%.3f", a + b}')
+      d=$(awk -v a="$d" -v b="$deactivating_gb" 'BEGIN{printf "%.3f", a + b}')
+      act=$(awk -v a="$act" -v b="$activating_gb" 'BEGIN{printf "%.3f", a + b}')
     else
-        prev_count=0
-        prev_percent=0
-        prev_active=0
-        prev_deactivating=0
-        prev_activating=0
+      new_count=1
+      a="$active_gb"
+      d="$deactivating_gb"
+      act="$activating_gb"
     fi
 
-    curr_count=$count
-    curr_active=$active
-    curr_deactivating=$deactivating
-    curr_activating=$activating
+    percent=$(awk -v a="$a" -v b="$TOTAL_ACTIVE_STAKE" 'BEGIN {if(b==0) print 0; else printf "%.3f", 100 * a / b}')
+    data["$NAME"]="$new_count:$NAME:$percent:$a:$d:$act"
 
-    total_count=$((prev_count + curr_count))
-    total_active=$(awk -v a="$prev_active" -v b="$curr_active" 'BEGIN{printf "%.3f", a + b}')
-    total_deactivating=$(awk -v a="$prev_deactivating" -v b="$curr_deactivating" 'BEGIN{printf "%.3f", a + b}')
-    total_activating=$(awk -v a="$prev_activating" -v b="$curr_activating" 'BEGIN{printf "%.3f", a + b}')
-    percent=$(awk -v a="$total_active" -v b="$TOTAL_ACTIVE_STAKE" 'BEGIN {if(b==0) print 0; else printf "%.3f", 100 * a / b}')
-
-    data["$key_for_data"]=$total_count:$NAME:$(
-        echo "$percent" | sed -r 's/^(.{12}).*$/\1/'
-    ):$(
-        echo "$total_active" | sed -r 's/^(.{12}).*$/\1/'
-    ):$(
-        echo "$total_deactivating" | sed -r 's/^(.{12}).*$/\1/'
-    ):$(
-        echo "$total_activating" | sed -r 's/^(.{12}).*$/\1/'
-    )
+    USED_STAKE_KEYS["$stake_pubkey"]=1
+  done
 done
 
 
-OTHER_percent=$(awk -v a="$OTHER_active" -v b="$TOTAL_ACTIVE_STAKE" 'BEGIN{if(b==0) print 0; else printf "%.3f", 100 * a / b}')
 
-data["OTHER"]=$OTHER_count:OTHER:$(
-    echo "$OTHER_percent" | sed -r 's/^(.{12}).+$/\1/'
-):$(
-    echo "$OTHER_active" | sed -r 's/^(.{12}).+$/\1/'
-):$(
-    echo "$OTHER_deactivating" | sed -r 's/^(.{12}).+$/\1/'
-):$(
-    echo "$OTHER_activating" | sed -r 's/^(.{12}).+$/\1/'
-)
+
+# processed=0
+# start_time=$(date +%s)
+
+# ➕ Фаза 2: WITHDRAWER KEY обробка
+for w_key in "${!INDEX_BY_WTHDR[@]}"; do
+
+#   ((processed++))
+#   if (( processed % 10 == 0 )); then
+#     current_time=$(date +%s)
+#     elapsed=$((current_time - start_time))
+#     total=${#INDEX_BY_WTHDR[@]}
+# 
+#     elapsed_fmt=$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))
+#     if (( processed > 0 )); then
+#       estimated_total_time=$(( (elapsed * total) / processed ))
+#       remaining=$((estimated_total_time - elapsed))
+#       remaining_fmt=$(printf '%02d:%02d' $((remaining/60)) $((remaining%60)))
+#     else
+#       remaining_fmt="??:??"
+#     fi
+# 
+#     echo -e "${LIGHTGRAY}WTHDR KEY | Processed $processed / $total pairs... (${elapsed_fmt} elapsed, ~${remaining_fmt} remaining)${NOCOLOR}"
+#   fi
+
+  for stake_pubkey in "${ALL_STAKE_PUBKEYS[@]}"; do
+    [[ -n "${USED_STAKE_KEYS[$stake_pubkey]}" ]] && continue
+    [[ "${STAKE_ACCOUNT_WITHDRAWER[$stake_pubkey]}" != "$w_key" ]] && continue
+
+    index="${INDEX_BY_WTHDR[$w_key]}"
+    case "$AGGREGATION_MODE" in
+      pool) NAME="${STAKE_NAMES[$index]}" ;;
+      group) NAME="${POOL_GROUPS[$index]:-UNKNOWN}" ;;
+      category) NAME="${POOL_CATEGORIES[$index]:-UNKNOWN}" ;;
+    esac
+
+    [[ -z "$NAME" ]] && continue
+
+    active=${STAKE_ACCOUNT_ACTIVE[$stake_pubkey]}
+    activating=${STAKE_ACCOUNT_ACTIVATING[$stake_pubkey]}
+    deactivating=${STAKE_ACCOUNT_DEACTIVATING[$stake_pubkey]}
+
+    active_gb=$(awk -v n="$active" 'BEGIN{printf "%.3f", n/1e9}')
+    activating_gb=$(awk -v n="$activating" 'BEGIN{printf "%.3f", n/1e9}')
+    deactivating_gb=$(awk -v n="$deactivating" 'BEGIN{printf "%.3f", n/1e9}')
+
+    # Агрегація ключів
+    if [[ -n "${NAME_TO_KEY[$NAME]}" ]]; then
+      if [[ ! "${NAME_TO_KEY[$NAME]}" =~ (^|[+])${w_key}($|[+]) ]]; then
+        NAME_TO_KEY[$NAME]="${NAME_TO_KEY[$NAME]}+$w_key"
+      fi
+    else
+      NAME_TO_KEY[$NAME]="$w_key"
+    fi
+
+    if [[ -n "${data[$NAME]}" ]]; then
+      IFS=":" read -r count oldname percent a d act <<< "${data[$NAME]}"
+      new_count=$((count + 1))
+      a=$(awk -v a="$a" -v b="$active_gb" 'BEGIN{printf "%.3f", a + b}')
+      d=$(awk -v a="$d" -v b="$deactivating_gb" 'BEGIN{printf "%.3f", a + b}')
+      act=$(awk -v a="$act" -v b="$activating_gb" 'BEGIN{printf "%.3f", a + b}')
+    else
+      new_count=1
+      a="$active_gb"
+      d="$deactivating_gb"
+      act="$activating_gb"
+    fi
+
+    percent=$(awk -v a="$a" -v b="$TOTAL_ACTIVE_STAKE" 'BEGIN {if(b==0) print 0; else printf "%.3f", 100 * a / b}')
+    data["$NAME"]="$new_count:$NAME:$percent:$a:$d:$act"
+
+    USED_STAKE_KEYS["$stake_pubkey"]=1
+  done
+done
+
+
+# processed=0
+# start_time=$(date +%s)
+
+# ➕ Фаза 3: інші (OTHER)
+UNUSED_STAKE_KEYS=()
+for stake_pubkey in "${ALL_STAKE_PUBKEYS[@]}"; do
+    
+# ((processed++))
+# if (( processed % 1000 == 0 )); then
+#   current_time=$(date +%s)
+#   elapsed=$((current_time - start_time))
+#   total=${#ALL_STAKE_PUBKEYS[@]}
+# 
+#   # Форматований час, що минув
+#   elapsed_fmt=$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))
+# 
+#   # Оцінка часу до кінця (на основі середньої швидкості)
+#   if (( processed > 0 )); then
+# 	estimated_total_time=$(( (elapsed * total) / processed ))
+# 	remaining=$((estimated_total_time - elapsed))
+# 	remaining_fmt=$(printf '%02d:%02d' $((remaining/60)) $((remaining%60)))
+#   else
+# 	remaining_fmt="??:??"
+#   fi
+# 
+#   echo -e "${LIGHTGRAY}OTHER KEY | Processed $processed / $total pairs... (${elapsed_fmt} elapsed, ~${remaining_fmt} remaining)${NOCOLOR}"
+# fi
+
+  [[ -z "${USED_STAKE_KEYS[$stake_pubkey]}" ]] && UNUSED_STAKE_KEYS+=("$stake_pubkey")
+done
+
+
+if (( ${#UNUSED_STAKE_KEYS[@]} > 0 )); then
+  UNUSED_KEYS_FILE=$(mktemp "/tmp/unused_keys_$(date +%s%N)_XXXXXX.json")
+  printf '%s\n' "${UNUSED_STAKE_KEYS[@]}" | jq -R . | jq -s . > "$UNUSED_KEYS_FILE"
+
+  OTHER_SUMS=$(jq -r --slurpfile keys "$UNUSED_KEYS_FILE" '
+    [ .[] | select(.stakePubkey as $key | $keys[0] | index($key)) ] |
+    [
+      ([.[].activeStake // 0] | add) / 1e9,
+      ([.[].deactivatingStake // 0] | add) / 1e9,
+      ([.[].activatingStake // 0] | add) / 1e9,
+      length
+    ] | @tsv
+  ' "$ALL_MY_STAKES_FILE")
+
+  rm -f "$UNUSED_KEYS_FILE"
+
+  read -r a d act count <<< "$OTHER_SUMS"
+  percent=$(awk -v a="$a" -v b="$TOTAL_ACTIVE_STAKE" 'BEGIN {if(b==0) print 0; else printf "%.3f", 100 * a / b}')
+  data["OTHER"]="$count:OTHER:$percent:$a:$d:$act"
+
+  for stake_pubkey in "${UNUSED_STAKE_KEYS[@]}"; do
+    USED_STAKE_KEYS["$stake_pubkey"]=1
+  done
+fi
+
 
 
 
@@ -597,4 +558,12 @@ printf "%-47s %-7d %-23s ${LIGHTBLUE}%-15s${NOCOLOR} ${CYAN}%-15s${NOCOLOR} ${RE
   "TOTAL:" "$TOTAL_ACTIVE_STAKE_COUNT" "" "$percent" "$TOTAL_ACTIVE_STAKE" "$DEACTIVATING_STAKE" "$ACTIVATING_STAKE"
 
 
+
+  current_time=$(date +%s)
+  elapsed=$((current_time - start_time))
+  elapsed_fmt=$(printf '%02d:%02d' $((elapsed/60)) $((elapsed%60)))
+  echo -e "${LIGHTGRAY}----------(${elapsed_fmt} elapsed----------${NOCOLOR}"
+
+
 echo -e "${NOCOLOR}"
+
