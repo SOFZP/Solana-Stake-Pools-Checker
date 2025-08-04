@@ -2,7 +2,7 @@
 
 A powerful and flexible bash script for Solana validators and researchers to check and analyze the composition of stake accounts delegating to any validator. This tool categorizes stake based on known stake pools, groups, and categories, providing clear, aggregated insights directly in your terminal or in a machine-readable JSON format.
 
-This script helps you understand exactly who is staking to your validator — whether it's liquid staking pools like Marinade and Jito, investment funds, or individual stakers.
+This script helps you understand exactly who is staking to your validator - whether it's liquid staking pools like Marinade and Jito, investment funds, or individual stakers - and agregate this stakes or save its history.
 
 **Author: CryptoVik Validator** : [Website](https://cryptovik.info) / [Github](https://github.com/SOFZP) / [Stakewiz](https://stakewiz.com/validator/Fhks5gukimP6vxKYbRY4V1aw888EgHhpdDSscD9V6bub)
 <br>
