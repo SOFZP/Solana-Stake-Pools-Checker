@@ -198,9 +198,102 @@ else
   fi
 fi
 
-STAKEPOOL_URL="https://raw.githubusercontent.com/SOFZP/Solana-Stake-Pools-Research/main/stakepools_list.conf"
-STAKEPOOL_CACHE="${HOME}/.cache/stakepools_list.conf"
-STAKEPOOL_TMP="/tmp/stakepools_list_tmp.conf"
+# Function to safely parse CSV with proper handling of quoted fields
+function parse_csv_to_json() {
+    local csv_file="$1"
+    # Use perl for reliable CSV parsing
+    if command -v perl &>/dev/null; then
+        perl -e '
+            use strict;
+            use warnings;
+            
+            open(my $fh, "<", $ARGV[0]) or die "Cannot open file: $!";
+            my $header = <$fh>;  # Skip header
+            
+            print "[";
+            my $first = 1;
+            
+            while (my $line = <$fh>) {
+                chomp $line;
+                next if $line =~ /^#/ || $line eq "";
+                
+                # Parse CSV line properly
+                my @fields = ();
+                my $field = "";
+                my $in_quotes = 0;
+                
+                for (my $i = 0; $i < length($line); $i++) {
+                    my $char = substr($line, $i, 1);
+                    
+                    if ($char eq "\"") {
+                        if ($i + 1 < length($line) && substr($line, $i + 1, 1) eq "\"") {
+                            $field .= "\"";
+                            $i++;
+                        } else {
+                            $in_quotes = !$in_quotes;
+                        }
+                    } elsif ($char eq "," && !$in_quotes) {
+                        push @fields, $field;
+                        $field = "";
+                    } else {
+                        $field .= $char;
+                    }
+                }
+                push @fields, $field;
+                
+                # Ensure 9 fields
+                push @fields, ("") x (9 - @fields) if @fields < 9;
+                
+                # Skip if no public_key (index 4)
+                next if !$fields[4];
+                
+                # Clean fields
+                for (@fields) {
+                    s/^\s+|\s+$//g;
+                    s/\"/\\\"/g;
+                }
+                
+                print "," if !$first;
+                $first = 0;
+                
+                printf "{\"short_name\":\"%s\",\"type\":\"%s\",\"group\":\"%s\",\"category\":\"%s\",\"public_key\":\"%s\",\"long_name\":\"%s\",\"description\":\"%s\",\"url\":\"%s\",\"image\":\"%s\"}",
+                    @fields[0..8];
+            }
+            close($fh);
+            
+            print "]";
+        ' "$csv_file"
+    else
+        # Fallback to awk if perl is not available
+        awk -F',' '
+        NR==1 { next }  # Skip header
+        /^#/ || NF==0 { next }  # Skip comments and empty lines
+        {
+            # Handle each field, preserving empty ones
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            
+            # Ensure we have 9 fields
+            for (i = NF + 1; i <= 9; i++) $i = ""
+            
+            # Skip if no public_key (field 5)
+            if ($5 == "") next
+            
+            # Clean quotes
+            for (i = 1; i <= 9; i++) {
+                gsub(/^"|"$/, "", $i)
+                gsub(/""/, "\"", $i)
+            }
+            
+            # Output JSON
+            printf "{\"short_name\":\"%s\",\"type\":\"%s\",\"group\":\"%s\",\"category\":\"%s\",\"public_key\":\"%s\",\"long_name\":\"%s\",\"description\":\"%s\",\"url\":\"%s\",\"image\":\"%s\"}\n",
+                   $1, $2, $3, $4, $5, $6, $7, $8, $9
+        }' "$csv_file" | jq -s '.'
+    fi
+}
+
+STAKEPOOL_URL="https://raw.githubusercontent.com/SOFZP/Solana-Stake-Pools-Research/main/stakepools_list.csv"
+STAKEPOOL_CACHE="${HOME}/.cache/stakepools_list.csv"
+STAKEPOOL_TMP="/tmp/stakepools_list_tmp.csv"
 mkdir -p "$(dirname "$STAKEPOOL_CACHE")"
 download_needed=true
 if [[ -f "$STAKEPOOL_CACHE" ]]; then
@@ -216,7 +309,7 @@ if [[ -f "$STAKEPOOL_CACHE" ]]; then
   fi
 else
   curl -sf "$STAKEPOOL_URL" -o "$STAKEPOOL_CACHE" || {
-    echo -e "${RED}❌ Failed to fetch stakepools_list.conf and no local copy exists.${NOCOLOR}"
+    echo -e "${RED}❌ Failed to fetch stakepools_list.csv and no local copy exists.${NOCOLOR}"
     exit 1
   }
 fi
@@ -330,9 +423,14 @@ declare -A STAKE_WITHDRAWER_MAP
 declare -A POOL_DEFINITIONS
 declare -a POOL_DEF_ORDER
 
-while IFS=$'\t' read -r short_name type group category public_key long_name image description url; do
-  [[ "$short_name" =~ ^#.*$ || -z "$public_key" ]] && continue
+# Parse CSV once and store in variable
+PARSED_CSV_JSON=$(parse_csv_to_json "$STAKEPOOL_CONF")
+
+# Process parsed data - УВАГА: порядок полів відповідає CSV!
+while IFS=$'\t' read -r short_name type group category public_key long_name description url image; do
+  [[ -z "$public_key" ]] && continue
   POOL_DEF_ORDER+=("$short_name")
+  # Зберігаємо в оригінальному порядку для сумісності
   POOL_DEFINITIONS["$short_name"]="$short_name\t$type\t$group\t$category\t$public_key\t$long_name\t$image\t$description\t$url"
   resolved_pubkey="${public_key//YOUR_NODE_WITHDRAW_AUTHORITY/$NODE_WITHDRAW_AUTHORITY}"
   resolved_pubkey="${resolved_pubkey//YOUR_NODE_IDENTITY/$SOLANA_IDENTITY}"
@@ -342,7 +440,7 @@ while IFS=$'\t' read -r short_name type group category public_key long_name imag
   elif [[ "$type" == "W" ]]; then
     STAKE_WITHDRAWER_MAP["$resolved_pubkey"]="$local_info_string"
   fi
-done < "$STAKEPOOL_CONF"
+done < <(echo "$PARSED_CSV_JSON" | jq -r '.[] | [.short_name, .type, .group, .category, .public_key, .long_name, .description, .url, .image] | @tsv')
 
 ALL_MY_STAKES_JSON=$(retry_command "solana ${SOLANA_CLUSTER_CLI_OPT} stakes ${YOUR_VOTE_ACCOUNT} --output json-compact" 10 "" false)
 
