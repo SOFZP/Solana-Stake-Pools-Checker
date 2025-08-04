@@ -15,7 +15,7 @@ This script helps you understand exactly who is staking to your validator - whet
 ### **Example of Text Output**
 
 
-*Text Output Example: Pool, Group, Category modes:*
+*Text Output Example: Pool, Group, Category modes for different validators, sorted by active stakes:*
 
 ![Text Output Example: Pool, Group, Category modes](https://raw.githubusercontent.com/SOFZP/Solana-Stake-Pools-Checker/refs/heads/main/stakepools-checker-demo1.png)
 
